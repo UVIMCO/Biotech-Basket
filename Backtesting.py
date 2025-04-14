@@ -214,7 +214,7 @@ class FilingBacktester:
         holdings_df = holdings_df.ffill()
         holdings_df = holdings_df.fillna(0)
         
-        # Multiply returns by aligned holdings and sum across securities
+        # Multiply returns by aligned holdings and sum across dates
         strategy_attribution = returns_df.multiply(holdings_df)
         strategy_attribution = strategy_attribution.sum(axis=0)
 
