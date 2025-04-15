@@ -61,23 +61,23 @@ class BacktesterData:
             Path to the managers Excel file
         """
 
+        # Manager Data
         self.manager_df = pd.read_excel(managers_path)
         self.manager_df['Contamination'] = self.manager_df['Contamination'] == 1.0
         self.manager_df['Not_Biotech'] = self.manager_df['Not_Biotech'] == 1.0
 
+        # Security Master Data from CIQ
         self.sec_master_df = pd.read_csv(sec_master_path)
         self.sec_master_df = self.sec_master_df.dropna(subset=['security_CIQ'])
         self.sec_master_df = self.sec_master_df[self.sec_master_df['is_biotech'] == True] # Filter for biotech securities
 
+        # Security Mapping Data (from BBG bulk pull)
         self.sec_mapping_df = pd.read_csv(sec_mapping_path)
         self.sec_mapping_df['Min_Px_Date'] = pd.to_datetime(self.sec_mapping_df['Min_Px_Date'], format='%Y-%m-%d')
         self.sec_mapping_df['Max_Px_Date'] = pd.to_datetime(self.sec_mapping_df['Max_Px_Date'], format='%Y-%m-%d')
         self.sec_mapping_df['Ticker'] = self.sec_mapping_df['Ticker'].str[:-7] # Drop the " Equity" from the ticker
 
-        self.sec_out_df = pd.read_csv(sec_out_path)
-        self.sec_out_df['date'] = pd.to_datetime(self.sec_out_df['date'])
-        self.sec_out_df['Ticker'] = self.sec_out_df['Ticker'].str[:-7] # Drop the " Equity" from the ticker
-
+        # Holdings Data long format from CIQ
         self.holdings_df = pd.read_csv(holdings_path)
         self.holdings_df = self.holdings_df.dropna(subset=['security_CIQ'])
         self.holdings_df['holding_date'] = pd.to_datetime(self.holdings_df['holding_date'], format='%Y-%m-%d')
@@ -103,6 +103,11 @@ class BacktesterData:
         self.holdings_df = self.holdings_df.groupby(['holding_date', 'Master', 'Ticker']).agg({'value': 'sum'}).reset_index()
         self.holdings_df = self.holdings_df[['holding_date', 'Master', 'Ticker', 'value']]
 
+        # Daily Security Data (from BBG bulk pull)
+        self.sec_out_df = pd.read_csv(sec_out_path)
+        self.sec_out_df['date'] = pd.to_datetime(self.sec_out_df['date'])
+        self.sec_out_df['Ticker'] = self.sec_out_df['Ticker'].str[:-7] # Drop the " Equity" from the ticker
+        
         self.sec_rets_df = self.sec_out_df.pivot(index='date', columns='Ticker', values='TOT_RETURN_INDEX_GROSS_DVDS')
         self.sec_rets_df = self.sec_rets_df.sort_index()
         self.sec_rets_df = self.sec_rets_df.replace(0, np.nan).ffill()
@@ -119,16 +124,24 @@ class BacktesterData:
         self.sec_price_df = self.sec_price_df.sort_index()
 
         self.value_traded_df = self.sec_vol_df.rolling(window=90, min_periods=1).median() * self.sec_price_df
-        self.eligible_securities_df = self.sec_mkt_cap_df.apply(get_top_pct, axis=1)
+        
+        self.eligible_securities_df = self.sec_mkt_cap_df.shift(1).apply(get_top_pct, axis=1)
 
 class FilingBacktester:
     def __init__(self, data):
         
+        # Manager Data
         self.manager_df = data.manager_df
+
+        # Holdings Data long format
         self.holdings_df = data.holdings_df
+
+        # Daily Security Data
         self.sec_rets_df = data.sec_rets_df
         self.sec_mkt_cap_df = data.sec_mkt_cap_df
         self.sec_vol_df = data.sec_vol_df
+
+        # Derived from daily security data
         self.eligible_securities_df = data.eligible_securities_df
         self.value_traded_df = data.value_traded_df
 
@@ -221,6 +234,8 @@ class FilingBacktester:
         return strategy_attribution
     
     def standardize_factor_scores(self, scores, clip_value=4):
+
+        # BBG methodology
 
         mkt_cap = self.sec_mkt_cap_df.reindex(index=scores.index, columns=scores.columns)
         eligible = self.eligible_securities_df.reindex(index=scores.index, columns=scores.columns)
