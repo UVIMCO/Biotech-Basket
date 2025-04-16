@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import statsmodels.api as sm
 
 def get_top_pct(row, pct=0.999):
     # Drop NaN values
@@ -125,7 +126,9 @@ class BacktesterData:
 
         self.value_traded_df = self.sec_vol_df.rolling(window=90, min_periods=1).median() * self.sec_price_df
         
-        self.eligible_securities_df = self.sec_mkt_cap_df.shift(1).apply(get_top_pct, axis=1)
+        # Get eligible securities based on market cap and price criteria
+        # Ensure price is > $1.00 based on max price over past 30 days
+        self.eligible_securities_df = self.sec_mkt_cap_df.shift(1).apply(get_top_pct, axis=1) & (self.sec_price_df.rolling(window=30, min_periods=1).max().shift(1) > 1.00)
 
 class FilingBacktester:
     def __init__(self, data):
@@ -229,7 +232,6 @@ class FilingBacktester:
         
         # Multiply returns by aligned holdings and sum across dates
         strategy_attribution = returns_df.multiply(holdings_df)
-        strategy_attribution = strategy_attribution.sum(axis=0)
 
         return strategy_attribution
     
@@ -256,3 +258,92 @@ class FilingBacktester:
         scores = scores.sub(weighted_mean, axis=0)
 
         return scores
+    
+    def get_factor_returns(self, factor_scores, clip_z=4):
+
+        #Ensure that factor_scores for date n only use information from date n-1 and earlier
+
+        valid_rets = (self.sec_rets_df == 0).sum(axis=1) < 0.9*len(self.sec_rets_df.columns)
+        mkt_cap = self.sec_mkt_cap_df.multiply(self.eligible_securities_df)
+        mkt_cap = mkt_cap.replace(0, np.nan)
+        mkt_cap = mkt_cap.loc[valid_rets]
+        rets = self.sec_rets_df.loc[valid_rets]
+
+        factor_rets = pd.DataFrame(index=rets.index, columns=list(factor_scores.keys()) + ["Market"], dtype=np.float64)
+
+        for i in range(1, len(rets)):
+            date = rets.index[i]
+            prev_date = rets.index[i-1]
+
+            day_rets = rets.loc[date]
+            prev_mkt_cap = mkt_cap.loc[prev_date]
+
+            cur_factor_scores = {factor: factor_scores[factor].loc[date] for factor in factor_scores}
+    
+            mask = ~(np.isnan(day_rets.values) | np.isnan(prev_mkt_cap.values) | np.logical_or.reduce([np.isnan(cur_factor_scores[factor].values) for factor in cur_factor_scores]))
+
+            day_rets = day_rets[mask]
+            prev_mkt_cap = prev_mkt_cap[mask]
+            cur_factor_scores = {factor: cur_factor_scores[factor][mask] for factor in cur_factor_scores}
+
+            day_rets = day_rets.clip(day_rets.mean()-clip_z*day_rets.std(), day_rets.mean()+clip_z*day_rets.std())
+
+            X = sm.add_constant(pd.DataFrame(cur_factor_scores))
+
+            try:
+                model = sm.WLS(day_rets, X, weights=prev_mkt_cap).fit()
+            except Exception as e:
+                print(f"Error fitting model for {date}: {e}")
+                factor_rets.loc[date, list(factor_scores.keys())] = np.nan
+                factor_rets.loc[date, "Market"] = np.nan
+                continue
+
+            factor_rets.loc[date, "Market"] = model.params['const']
+
+            for factor in factor_scores.keys():
+                factor_rets.loc[date, factor] = model.params[factor]
+
+        return factor_rets
+    
+    def get_factor_attribution(self, holdings_df, factor_scores, factor_returns, end_date):
+
+        #Get the factor attribution for 
+
+        tickers = holdings_df.columns
+        start_date = holdings_df.index.min()
+
+        rets = self.sec_rets_df[tickers].loc[start_date:end_date]
+
+        cur_factor_rets = factor_returns.loc[start_date:end_date]
+        cur_factor_scores = {factor: factor_scores[factor].loc[start_date:end_date] for factor in factor_scores.keys()}
+
+        port_factor_ctr = {factor: cur_factor_scores[factor].mul(cur_factor_rets[factor], axis=0).reindex(rets.index).astype(np.float64).fillna(0) for factor in factor_scores.keys()}
+        port_factor_ctr['Market'] = pd.DataFrame(cur_factor_rets['Market'].values.reshape(-1, 1).repeat(len(tickers), axis=1), 
+                                   index=cur_factor_rets.index, columns=tickers).reindex(rets.index).astype(np.float64).fillna(0)
+        
+        port_factor_ctr['Idio'] = rets
+        for factor in [k for k in port_factor_ctr.keys() if k != 'Idio']:
+            port_factor_ctr['Idio'] = port_factor_ctr['Idio'].sub(port_factor_ctr[factor])
+
+        holdings_df = holdings_df.reindex(rets.index)
+        holdings_df = holdings_df.shift(1)
+        holdings_df = holdings_df.ffill()
+        holdings_df = holdings_df.fillna(0)
+
+        port_factor_ctr = {factor: port_factor_ctr[factor].multiply(holdings_df).sum(axis=1) for factor in port_factor_ctr.keys()}
+        port_factor_ctr = pd.DataFrame(port_factor_ctr)
+
+        return port_factor_ctr
+    
+    def carino_attribution(ctr_df):
+
+        # Carino attribution for port_factor_ctr
+        cum_log_return = np.log(ctr_df.sum(axis=1) + 1).cumsum()
+        log_return = np.log(ctr_df.sum(axis=1) + 1)
+        total_log_return = cum_log_return.iloc[-1]
+        carino_factor = (log_return/total_log_return) * ((np.exp(total_log_return)-1)/(np.exp(log_return)-1))
+
+        attr = ctr_df.multiply(carino_factor, axis=0).sum(axis=0)
+        return attr
+        
+        
