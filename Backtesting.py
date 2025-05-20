@@ -101,13 +101,13 @@ class BacktesterData:
         self.holdings_df = pd.merge(self.holdings_df, self.sec_mapping_df, on='Ticker', how='left')
         self.holdings_df = self.holdings_df.dropna(subset=['Ticker'])
 
-        self.error_df = self.holdings_df[(self.holdings_df['PX_NA_Flag'] == True) |
-                       (self.holdings_df['Max_Px_Date'] < self.holdings_df['holding_date']) |
-                       (self.holdings_df['Min_Px_Date'] > self.holdings_df['holding_date'])]
+        self.error_df = self.holdings_df[(self.holdings_df['Max_Px_Date'] < self.holdings_df['holding_date']) |
+                       (self.holdings_df['Min_Px_Date'] > self.holdings_df['holding_date']) |
+                       (self.holdings_df['Max_Px_Date'].isna()) |
+                       (self.holdings_df['Min_Px_Date'].isna())]
         self.error_df = self.error_df[['holding_date', 'Master', 'Ticker', 'value', 'Name', 'PX_NA_Flag', 'Max_Px_Date', 'Min_Px_Date']]
 
-        self.holdings_df = self.holdings_df[(self.holdings_df['PX_NA_Flag'] == False) &
-                       (self.holdings_df['Max_Px_Date'] >= self.holdings_df['holding_date']) &
+        self.holdings_df = self.holdings_df[(self.holdings_df['Max_Px_Date'] >= self.holdings_df['holding_date']) &
                        (self.holdings_df['Min_Px_Date'] <= self.holdings_df['holding_date'])]
         
         self.holdings_df = self.holdings_df.groupby(['holding_date', 'Master', 'Ticker']).agg({'value': 'sum'}).reset_index()
