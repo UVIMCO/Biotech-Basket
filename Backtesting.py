@@ -123,9 +123,14 @@ class BacktesterData:
         self.sec_rets_df = self.sec_rets_df.replace(0, np.nan).ffill()
         self.sec_rets_df = self.sec_rets_df / self.sec_rets_df.shift(1) - 1
         self.sec_rets_df = self.sec_rets_df.fillna(0)
-
         self.sec_mkt_cap_df = self.sec_out_df.pivot(index='date', columns='Ticker', values='CUR_MKT_CAP')
         self.sec_mkt_cap_df = self.sec_mkt_cap_df.sort_index()
+        
+        # Set market cap to NA for specific indices
+        indices_to_exclude = ['XBI US', 'IBB US', 'MSXXNCB', 'LSCIB']
+        for idx in indices_to_exclude:
+            if idx in self.sec_mkt_cap_df.columns:
+                self.sec_mkt_cap_df[idx] = np.nan
 
         self.sec_vol_df = self.sec_out_df.pivot(index='date', columns='Ticker', values='PX_VOLUME')
         self.sec_vol_df = self.sec_vol_df.sort_index()
