@@ -14,8 +14,17 @@ def get_top_pct(row, pct=0.999):
     # Calculate cumulative percentage
     cumulative_pct = sorted_values.cumsum() / sorted_values.sum()
     
-    # Create a mask for values within 99.9%
+    # Create a mask for values within the threshold
     mask = cumulative_pct <= pct
+    
+    # Add one more item to go over the threshold
+    # Get the count of True values
+    true_count = mask.sum()
+    
+    # If we have items and haven't included everything already
+    if true_count < len(sorted_values):
+        # Add one more item (the next one after the cutoff)
+        mask.iloc[true_count] = True
     
     # Create result series with the same index as the input row
     result = pd.Series(False, index=row.index)
@@ -148,10 +157,12 @@ class FilingBacktester:
         self.eligible_securities_df = data.eligible_securities_df
         self.value_traded_df = data.value_traded_df
 
-    def get_fund_holdings(self, fund_name, eligible_securities=True, mvs=False, contamination=False):
-
-        start_date = self.manager_df.loc[self.manager_df['Master'] == fund_name, 'Public_Start'].values[0]
-        end_date = self.manager_df.loc[self.manager_df['Master'] == fund_name, 'Public_End'].values[0]
+    def get_fund_holdings(self, fund_name, eligible_securities=True, normalize=True, contamination=False, start_date=None, end_date=None):        
+        
+        if start_date is None:
+            start_date = self.manager_df.loc[self.manager_df['Master'] == fund_name, 'Public_Start'].values[0]
+        if end_date is None:
+            end_date = self.manager_df.loc[self.manager_df['Master'] == fund_name, 'Public_End'].values[0]
 
         holdings_df = self.holdings_df[self.holdings_df['Master'] == fund_name]
 
@@ -162,6 +173,7 @@ class FilingBacktester:
         if end_date is not None and pd.notna(end_date):
             holdings_df = holdings_df[holdings_df['holding_date'] <= end_date]
 
+        holdings_df = holdings_df.groupby(['holding_date', 'Ticker']).agg({'value': 'sum'}).reset_index()
         holdings_df = holdings_df.pivot(index='holding_date', columns='Ticker', values='value')
         holdings_df = holdings_df.sort_index()
 
@@ -176,18 +188,70 @@ class FilingBacktester:
             mean_ownership = holdings_df.sum(axis=1)/mkt_cap.sum(axis=1)
             holdings_df = holdings_df.sub(mkt_cap.multiply(mean_ownership, axis=0)).clip(lower=0)
   
-        if not mvs:
+        if normalize:
             holdings_df = holdings_df.div(holdings_df.sum(axis=1), axis=0)
             holdings_df = holdings_df.fillna(0)
 
         return holdings_df
-    
-    def adjust_holdings(self, holdings_df, max_participation=0.1, port_size=100000000, pct=None, n=None):
+        
+    def adjust_holdings(self, holdings_df, mvs=False, max_participation=None, port_size=None, pct=None, n=None):
 
-        value_traded = self.value_traded_df.reindex(index=holdings_df.index, columns=holdings_df.columns)
-        max_position_size = value_traded.multiply(max_participation / port_size)
-        holdings_df = holdings_df.clip(upper=max_position_size, axis=None)
+        if max_participation is not None and port_size is not None:
+            value_traded = self.value_traded_df.reindex(index=holdings_df.index, columns=holdings_df.columns)
+            max_position_size = value_traded.multiply(max_participation / port_size)
 
+            adjusted_holdings_df = holdings_df.copy()
+            fixed_mask_df = pd.DataFrame(False, index=holdings_df.index, columns=holdings_df.columns)
+            num_securities = holdings_df.shape[1]
+            converged = False
+            for iteration in range(num_securities):
+
+                over_limit_mask_df = (adjusted_holdings_df > max_position_size) & (~fixed_mask_df)
+                
+                if not over_limit_mask_df.any().any():
+                    converged = True
+                    break
+                    
+                # Fix any positions over the limit
+                adjusted_holdings_df = adjusted_holdings_df.where(~over_limit_mask_df, max_position_size)
+
+                # Get the remaining budget needed to be filled by non-fixed securities
+                fixed_mask_df = fixed_mask_df | over_limit_mask_df
+                fixed_sums = (adjusted_holdings_df * fixed_mask_df).sum(axis=1)
+                remaining_budgets = (1.0 - fixed_sums).clip(lower=0)
+
+                # Get the sum of the non-fixed securities
+                non_fixed_sums = (adjusted_holdings_df * ~fixed_mask_df).sum(axis=1)
+                
+                scaling_factors = remaining_budgets / non_fixed_sums.replace(0, np.nan)
+                # Handle NaN resulting from 0/0 or x/0
+                scaling_factors = scaling_factors.fillna(0).infer_objects(copy=False)
+                non_fixed_adjusted = adjusted_holdings_df.multiply(scaling_factors, axis=0)
+                adjusted_holdings_df = adjusted_holdings_df.where(fixed_mask_df, non_fixed_adjusted).infer_objects(copy=False)
+
+            if not converged:
+                final_over_limit_mask_df = (adjusted_holdings_df > max_position_size + 1e-9) & (~fixed_mask_df)
+                if final_over_limit_mask_df.any().any():
+                     raise RuntimeError(f"Failed to converge after {num_securities} iterations. Constraints might be infeasible or numerical issues occurred.")
+
+            final_row_sums = adjusted_holdings_df.sum(axis=1)
+            min_sum_threshold = 0.99
+            low_sum_mask = final_row_sums < min_sum_threshold
+            
+            if low_sum_mask.any():
+                problematic_sums = final_row_sums[low_sum_mask]
+                error_details = "\n".join([f"  Date: {date.strftime('%Y-%m-%d')}, Max Portfolio Capacity: {sum_val*port_size:.6f}" for date, sum_val in problematic_sums.items()])
+                warning_message = (
+                    f"Warning: Final portfolio weights sum to less than {min_sum_threshold} "
+                    f"after iterative adjustment on some dates.\n"
+                    f"Portfolio size was: {port_size} dollars.\n"
+                    f"Problematic Dates and Actual Weight Sums:\n{error_details}"
+                )
+                print(warning_message)
+
+            adjusted_holdings_df = adjusted_holdings_df.div(final_row_sums, axis=0)
+            adjusted_holdings_df = adjusted_holdings_df.fillna(0)
+            holdings_df = adjusted_holdings_df
         if pct is not None:
             top_pct = holdings_df.apply(get_top_pct, axis=1, pct=pct)
             holdings_df = holdings_df.multiply(top_pct)
@@ -195,8 +259,9 @@ class FilingBacktester:
             top_n = holdings_df.apply(get_top_n, axis=1, n=n)
             holdings_df = holdings_df.multiply(top_n)
 
-        row_sums = holdings_df.sum(axis=1)
-        holdings_df = holdings_df.div(row_sums.replace(0, np.nan), axis=0).fillna(0)
+        if not mvs:
+            row_sums = holdings_df.sum(axis=1)
+            holdings_df = holdings_df.div(row_sums.replace(0, np.nan), axis=0).fillna(0)
 
         return holdings_df
 
@@ -307,7 +372,7 @@ class FilingBacktester:
     
     def get_factor_attribution(self, holdings_df, factor_scores, factor_returns, end_date):
 
-        #Get the factor attribution for 
+        #Get the factor attribution for a portfolio of holdings
 
         tickers = holdings_df.columns
         start_date = holdings_df.index.min()
@@ -346,4 +411,58 @@ class FilingBacktester:
         attr = ctr_df.multiply(carino_factor, axis=0).sum(axis=0)
         return attr
         
+    def get_period_returns(self, dates=None):
+        # Create quarter-end dates (with 45 day offset for reporting lag)
+        if dates is None:
+            dates = pd.date_range(start='2014-12-31', end='2025-03-31', freq='QE') + pd.DateOffset(days=45)
+        # Filter to relevant date range
+        sec_rets_df = self.sec_rets_df[(min(dates)+pd.Timedelta(days=1)):max(dates)].copy()
+
+        date_to_quarter = pd.Series(dates, index=dates)
+        quarter_end_series = date_to_quarter.reindex(sec_rets_df.index, method=None)
+        sec_rets_df.loc[:, 'quarter_end'] = quarter_end_series
+        sec_rets_df.loc[:, 'quarter_end'] = sec_rets_df['quarter_end'].bfill()
+        # Calculate quarterly returns directly using prod
+
+
+        quarter_end_returns = sec_rets_df.groupby('quarter_end').apply(
+            lambda x: (1 + x.drop('quarter_end', axis=1)).prod() - 1
+        )
+
+        return quarter_end_returns
+    
+    def get_period_idio_returns(self, factor_scores, factor_returns, dates=None):
+
+        if dates is None: 
+            dates = pd.date_range(start='2014-12-31', end='2025-03-31', freq='QE') + pd.DateOffset(days=45)
+
+        start_date = dates.min()
+        end_date = dates.max()
+
+        tickers = factor_scores[list(factor_scores.keys())[0]].columns
+
+        rets = self.sec_rets_df[tickers].loc[start_date:end_date]
+
+        cur_factor_rets = factor_returns.loc[start_date:end_date]
+        cur_factor_scores = {factor: factor_scores[factor].loc[start_date:end_date] for factor in factor_scores.keys()}
+
+        port_factor_ctr = {factor: cur_factor_scores[factor].mul(cur_factor_rets[factor], axis=0).reindex(rets.index).astype(np.float64).fillna(0) for factor in factor_scores.keys()}
+        port_factor_ctr['Market'] = pd.DataFrame(cur_factor_rets['Market'].values.reshape(-1, 1).repeat(len(tickers), axis=1), 
+                                   index=cur_factor_rets.index, columns=tickers).reindex(rets.index).astype(np.float64).fillna(0)
         
+        port_factor_ctr['Idio'] = rets
+        for factor in [k for k in port_factor_ctr.keys() if k != 'Idio']:
+            port_factor_ctr['Idio'] = port_factor_ctr['Idio'].sub(port_factor_ctr[factor])
+        
+        idio_returns = port_factor_ctr['Idio']
+
+        date_to_quarter = pd.Series(dates, index=dates)
+        quarter_end_series = date_to_quarter.reindex(idio_returns.index, method=None)
+        idio_returns.loc[:, 'quarter_end'] = quarter_end_series
+        idio_returns.loc[:, 'quarter_end'] = idio_returns['quarter_end'].bfill()
+
+        quarter_end_returns = idio_returns.groupby('quarter_end').apply(
+            lambda x: (1 + x.drop('quarter_end', axis=1)).prod() - 1
+        )
+
+        return quarter_end_returns
