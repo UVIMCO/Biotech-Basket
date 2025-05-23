@@ -181,11 +181,10 @@ class FilingBacktester:
         holdings_df = holdings_df.groupby(['holding_date', 'Ticker']).agg({'value': 'sum'}).reset_index()
         holdings_df = holdings_df.pivot(index='holding_date', columns='Ticker', values='value')
         holdings_df = holdings_df.sort_index()
-
-        eligible_securities = self.eligible_securities_df.reindex(index=holdings_df.index, columns=holdings_df.columns)
-
-        holdings_df = holdings_df * eligible_securities
-        holdings_df = holdings_df.fillna(0)
+        if eligible_securities:
+            eligible_securities = self.eligible_securities_df.reindex(index=holdings_df.index, columns=holdings_df.columns)
+            holdings_df = holdings_df * eligible_securities
+            holdings_df = holdings_df.fillna(0)
 
 
         if contamination:
@@ -277,33 +276,34 @@ class FilingBacktester:
         returns_df = self.sec_rets_df[tickers].loc[start_date:end_date]
 
         # Reindex holdings_df to match all dates in returns_df and fill forward
-        holdings_df = holdings_df.reindex(returns_df.index)
-        holdings_df = holdings_df.shift(1)
-        holdings_df = holdings_df.ffill()
-        holdings_df = holdings_df.fillna(0)
+        next_day_weights = holdings_df.reindex(returns_df.index)
+        next_day_weights = next_day_weights.ffill()
+
+        # Calculate cumulative returns for each security, resetting on rebalance dates
+        rebalance_dates = holdings_df.index
+        cum_returns = pd.DataFrame(index=returns_df.index, columns=returns_df.columns)
+
+        for i in range(len(rebalance_dates)):
+            start_date = rebalance_dates[i]
+            end_date = rebalance_dates[i + 1] if i < len(rebalance_dates) - 1 else returns_df.index[-1]
+            period_returns = returns_df.loc[start_date:end_date]
+            period_cum_returns = (1 + period_returns).cumprod()
+            # Set first value to 1 and adjust subsequent values accordingly
+            period_cum_returns = period_cum_returns / period_cum_returns.iloc[0]
+            cum_returns.loc[start_date:end_date] = period_cum_returns
+
+        next_day_weights = next_day_weights.multiply(cum_returns)
+        sum = next_day_weights.sum(axis=1)
+        sum = sum.replace(0, np.nan)
+        next_day_weights = next_day_weights.div(sum, axis=0)
+        curr_day_weights = next_day_weights.shift(1)
+        curr_day_weights = curr_day_weights.fillna(0)
         
         # Multiply returns by aligned holdings and sum across securities
-        strategy_returns = returns_df.multiply(holdings_df)
-        strategy_returns = strategy_returns.sum(axis=1)
+        attr = returns_df.multiply(curr_day_weights)
+        returns = attr.sum(axis=1)
 
-        return strategy_returns
-    
-    def get_strategy_attribution(self, holdings_df, end_date):
-
-        tickers = holdings_df.columns
-        start_date = holdings_df.index.min()
-        returns_df = self.sec_rets_df[tickers].loc[start_date:end_date]
-
-        # Reindex holdings_df to match all dates in returns_df and fill forward
-        holdings_df = holdings_df.reindex(returns_df.index)
-        holdings_df = holdings_df.shift(1)
-        holdings_df = holdings_df.ffill()
-        holdings_df = holdings_df.fillna(0)
-        
-        # Multiply returns by aligned holdings and sum across dates
-        strategy_attribution = returns_df.multiply(holdings_df)
-
-        return strategy_attribution
+        return returns, attr, curr_day_weights
     
     def standardize_factor_scores(self, scores, clip_value=4):
 
@@ -375,12 +375,12 @@ class FilingBacktester:
 
         return factor_rets
     
-    def get_factor_attribution(self, holdings_df, factor_scores, factor_returns, end_date):
+    def get_factor_attribution(self, weights_df, factor_scores, factor_returns, end_date):
 
         #Get the factor attribution for a portfolio of holdings
 
-        tickers = holdings_df.columns
-        start_date = holdings_df.index.min()
+        tickers = weights_df.columns
+        start_date = weights_df.index.min()
 
         rets = self.sec_rets_df[tickers].loc[start_date:end_date]
 
@@ -395,12 +395,7 @@ class FilingBacktester:
         for factor in [k for k in port_factor_ctr.keys() if k != 'Idio']:
             port_factor_ctr['Idio'] = port_factor_ctr['Idio'].sub(port_factor_ctr[factor])
 
-        holdings_df = holdings_df.reindex(rets.index)
-        holdings_df = holdings_df.shift(1)
-        holdings_df = holdings_df.ffill()
-        holdings_df = holdings_df.fillna(0)
-
-        port_factor_ctr = {factor: port_factor_ctr[factor].multiply(holdings_df).sum(axis=1) for factor in port_factor_ctr.keys()}
+        port_factor_ctr = {factor: port_factor_ctr[factor].multiply(weights_df).sum(axis=1) for factor in port_factor_ctr.keys()}
         port_factor_ctr = pd.DataFrame(port_factor_ctr)
 
         return port_factor_ctr
