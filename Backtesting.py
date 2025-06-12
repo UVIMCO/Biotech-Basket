@@ -110,13 +110,13 @@ class BacktesterData:
         self.holdings_df = self.holdings_df[(self.holdings_df['Max_Px_Date'] >= self.holdings_df['holding_date']) &
                        (self.holdings_df['Min_Px_Date'] <= self.holdings_df['holding_date'])]
         
-        self.holdings_df = self.holdings_df.groupby(['holding_date', 'Master', 'Ticker']).agg({'value': 'sum'}).reset_index()
-        self.holdings_df = self.holdings_df[['holding_date', 'Master', 'Ticker', 'value']]
+        self.holdings_df = self.holdings_df.groupby(['holding_date', 'Master', 'Ticker']).agg({'value': 'sum', 'shares': 'sum'}).reset_index()
+        self.holdings_df = self.holdings_df[['holding_date', 'Master', 'Ticker', 'value', 'shares']]
 
         # Daily Security Data (from BBG bulk pull)
         self.sec_out_df = pd.read_csv(sec_out_path)
         self.sec_out_df['date'] = pd.to_datetime(self.sec_out_df['date'])
-        self.sec_out_df['Ticker'] = self.sec_out_df['Ticker'].str[:-7] # Drop the " Equity" from the ticker
+        self.sec_out_df['Ticker'] = self.sec_out_df['Ticker'].apply(lambda x: ' '.join(x.split()[:-1])) # Drop the last word from the ticker
         
         self.sec_rets_df = self.sec_out_df.pivot(index='date', columns='Ticker', values='TOT_RETURN_INDEX_GROSS_DVDS')
         self.sec_rets_df = self.sec_rets_df.sort_index()
@@ -157,10 +157,75 @@ class FilingBacktester:
         self.sec_rets_df = data.sec_rets_df
         self.sec_mkt_cap_df = data.sec_mkt_cap_df
         self.sec_vol_df = data.sec_vol_df
+        self.sec_price_df = data.sec_price_df
 
         # Derived from daily security data
         self.eligible_securities_df = data.eligible_securities_df
         self.value_traded_df = data.value_traded_df
+
+    def get_holdings_dataset(self, fund_name):
+
+        holdings_df = self.holdings_df[self.holdings_df['Master'] == fund_name]
+        shares_df = holdings_df.pivot(index='holding_date', columns='Ticker', values='shares').fillna(0)
+        share_chg_df = shares_df.diff()
+        share_chg_df.iloc[0] = shares_df.iloc[0]
+        share_chg_df = share_chg_df.fillna(0)
+
+        value_df = holdings_df.pivot(index='holding_date', columns='Ticker', values='value')
+        price_df = self.sec_price_df.reindex(index=value_df.index, columns=value_df.columns)
+        mkt_cap_df = self.sec_mkt_cap_df.reindex(index=value_df.index, columns=value_df.columns)
+        value_traded_df = self.value_traded_df.reindex(index=value_df.index, columns=value_df.columns)
+        ownership_df = value_df.div(mkt_cap_df).fillna(0)
+        ownership_chg_df = share_chg_df.div(shares_df).multiply(ownership_df)
+        allocation_df = value_df.div(value_df.sum(axis=1), axis=0).fillna(0)
+        allocation_chg_df = allocation_df.diff()
+        allocation_chg_df.iloc[0] = allocation_df.iloc[0]
+        allocation_chg_df = allocation_chg_df.fillna(0)
+        
+        # Naive cost basis calculation: cumulative cost / cumulative shares bought
+        shares_bought = share_chg_df.where(share_chg_df > 0, 0)
+        cost_of_purchases = shares_bought * price_df
+        cum_cost = cost_of_purchases.cumsum()
+        cum_shares_bought = shares_bought.cumsum()
+        cost_basis_df = cum_cost.div(cum_shares_bought).fillna(0)
+
+        # Combine all dataframes into a single long-format dataframe
+        combined_df = pd.DataFrame()
+        
+        # Create a mask for valid values (not NaN and > 0)
+        valid_mask = (pd.notna(value_df) & (value_df > 0))
+        
+        # Stack all dataframes to long format and filter by valid mask
+        value_long = value_df.stack()[valid_mask.stack()]
+        shares_long = shares_df.stack().reindex(value_long.index).fillna(0)
+        share_chg_long = share_chg_df.stack().reindex(value_long.index).fillna(0)
+        price_long = price_df.stack().reindex(value_long.index).fillna(0)
+        mkt_cap_long = mkt_cap_df.stack().reindex(value_long.index).fillna(0)
+        value_traded_long = value_traded_df.stack().reindex(value_long.index).fillna(0)
+        ownership_long = ownership_df.stack().reindex(value_long.index).fillna(0)
+        ownership_chg_long = ownership_chg_df.stack().reindex(value_long.index).fillna(0)
+        allocation_long = allocation_df.stack().reindex(value_long.index).fillna(0)
+        allocation_chg_long = allocation_chg_df.stack().reindex(value_long.index).fillna(0)
+        cost_basis_long = cost_basis_df.stack().reindex(value_long.index).fillna(0)
+        
+        # Create combined dataframe
+        combined_df = pd.DataFrame({
+            'date': [idx[0] for idx in value_long.index],
+            'ticker': [idx[1] for idx in value_long.index],
+            'value': value_long.values,
+            'shares': shares_long.values,
+            'share_change': share_chg_long.values,
+            'price': price_long.values,
+            'market_cap': mkt_cap_long.values,
+            'value_traded': value_traded_long.values,
+            'ownership': ownership_long.values,
+            'ownership_change': ownership_chg_long.values,
+            'allocation': allocation_long.values,
+            'allocation_change': allocation_chg_long.values,
+            'cost_basis': cost_basis_long.values
+        })
+        
+        return combined_df
 
     def get_fund_holdings(self, fund_name, eligible_securities=True, normalize=True, contamination=False, start_date=None, end_date=None):        
         
@@ -178,7 +243,6 @@ class FilingBacktester:
         if end_date is not None and pd.notna(end_date):
             holdings_df = holdings_df[holdings_df['holding_date'] <= end_date]
 
-        holdings_df = holdings_df.groupby(['holding_date', 'Ticker']).agg({'value': 'sum'}).reset_index()
         holdings_df = holdings_df.pivot(index='holding_date', columns='Ticker', values='value')
         holdings_df = holdings_df.sort_index()
         if eligible_securities:

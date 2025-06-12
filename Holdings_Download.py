@@ -8,15 +8,18 @@ import os
 
 # Set Global Variables
 startDate = pd.Timestamp('2014-12-31').date()
-endDate = pd.Timestamp('2024-12-31').date()
+endDate = pd.Timestamp('2025-03-31').date()
 currency = "USD"
-holdings_path = 'Output/holdings.csv'
-holdings_index_path = 'Output/holdings_index.csv'
+
+prefix = "O:/AARM/Direct/Top Holdings/Research/Biotech/NW/"
+
+holdings_path = prefix + 'Output/holdings.csv'
+holdings_index_path = prefix + 'Output/holdings_index.csv'
 
 # import spreadsheet
-input_wb = xw.Book('Input/managers.xlsx')
+input_wb = xw.Book(prefix + 'Input/managers.xlsx')
 managerList = input_wb.sheets('List')
-download_wb = xw.Book('Input/download.xlsx')
+download_wb = xw.Book(prefix + 'Input/download.xlsx')
 download = download_wb.sheets('Sheet1')
 
 listDate = (pd.date_range(startDate, endDate + pd.offsets.QuarterBegin(1), freq = 'QE')
